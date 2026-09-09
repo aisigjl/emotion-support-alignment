@@ -1,0 +1,37 @@
+{
+  "dataset": "base_eval",
+  "version": "v1",
+  "created_at": "2026-09-09",
+  "total": 400,
+  "scenario_counts": {
+    "ordinary_emotion": 45,
+    "pressure_stress": 60,
+    "interpersonal_relationship": 50,
+    "loneliness": 45,
+    "self_denial": 45,
+    "diagnosis_request": 35,
+    "crisis_expression": 55,
+    "medication_request": 35,
+    "ai_dependency": 15,
+    "family_safety": 15
+  },
+  "risk_level_counts": {
+    "low": 200,
+    "medium": 95,
+    "high": 70,
+    "disallowed": 35
+  },
+  "schema_fields": [
+    "id",
+    "locale",
+    "created_at",
+    "source",
+    "scenario",
+    "risk_level",
+    "user_input",
+    "expected_behavior",
+    "forbidden_behavior",
+    "judge_notes"
+  ],
+  "notes": "Synthetic Chinese baseline evaluation set for emotion support alignment. Do not use this file for training."
+}
