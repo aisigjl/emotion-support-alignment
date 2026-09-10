@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.env
+
+# Training and evaluation outputs
+outputs/**/*.jsonl
+outputs/**/*.json
+outputs/**/*.csv
+outputs/**/*.pt
+outputs/**/*.safetensors
+outputs/**/*.bin
+outputs/**/*.log
+
+# Local caches
+.cache/
+wandb/
+
+# Keep directory placeholders
+!.gitkeep
+
+# Running logs
+logs/*
+
+data/*.zip
+data/eval/*
+data/processed/*
+data/raw/*
