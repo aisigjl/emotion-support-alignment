@@ -24,6 +24,9 @@
 - 已新增 SFT 蒸馏脚本：`scripts/distill_sft_with_gpt4o.py`
 - 已新增 DPO 蒸馏脚本：`scripts/distill_dpo_with_gpt4o.py`
 - 已新增训练数据蒸馏说明：`docs/training_data_distillation.md`
+- 已新增 SFT LoRA/QLoRA 训练脚本：`scripts/train_sft.py`
+- 已新增 SFT 训练配置：`configs/sft_lora_qwen3_4b.json`
+- 已新增 SFT 训练说明：`docs/sft_training.md`
 
 ## 目录结构
 
@@ -84,3 +87,5 @@ OPENAI_EVAL_MODEL=gpt-4o
 5. 蒸馏脚本支持 `--workers` 并发 API 调用，建议先用 `--workers 4`，稳定后再尝试 `--workers 8`。
 6. 小样本试跑 baseline：`python scripts/eval.py all --data-path data/eval/base_eval_v2_mixed.jsonl --limit 5 --batch-size 1 --max-new-tokens 128`。
 7. 确认输出无误后跑完整 baseline，并基于 judge 结果完成 `baseline_error_analysis.md`。
+8. 训练 SFT 前先跑 smoke test：`CUDA_VISIBLE_DEVICES=0 conda run -n emotion python scripts/train_sft.py --config configs/sft_lora_qwen3_4b.json --output-dir outputs/sft/smoke_qwen3_4b_sft_lora --max-train-samples 16 --max-eval-samples 4 --eval-size 4 --max-steps 2 --overwrite-output-dir`。
+9. smoke test 通过后跑完整 SFT：`CUDA_VISIBLE_DEVICES=0 conda run -n emotion python scripts/train_sft.py --config configs/sft_lora_qwen3_4b.json`。

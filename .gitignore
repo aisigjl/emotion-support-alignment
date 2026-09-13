@@ -5,13 +5,8 @@ __pycache__/
 .env
 
 # Training and evaluation outputs
-outputs/**/*.jsonl
-outputs/**/*.json
-outputs/**/*.csv
-outputs/**/*.pt
-outputs/**/*.safetensors
-outputs/**/*.bin
-outputs/**/*.log
+outputs/*
+!outputs/**/.gitkeep
 
 # Local caches
 .cache/
