@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import random
@@ -294,6 +295,7 @@ def summarize(rows: list[dict[str, Any]], processed_rows: list[dict[str, Any]], 
         "distiller_model": args.distiller_model,
         "retry_errors": args.retry_errors,
         "continue_on_error": args.continue_on_error,
+        "workers": args.workers,
         "notes": "Full-dialogue GPT-4o distillation into DPO prompt/chosen/rejected pairs. Keep separate from eval split.",
     }
 
@@ -302,6 +304,7 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     args.output_path = project_path(args.output_path)
     args.summary_path = project_path(args.summary_path)
     args.processed_log_path = project_path(args.processed_log_path)
+    args.workers = max(1, int(args.workers))
 
     if args.overwrite:
         for path in [args.output_path, args.summary_path, args.processed_log_path]:
@@ -311,9 +314,11 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     raw_files = load_raw_files(args)
     existing_rows = read_jsonl(args.output_path)
     processed = processed_raw_files(args.processed_log_path, args.output_path, args.retry_errors)
+    pending_files = [path for path in raw_files if relative_to_project(path, PROJECT_ROOT) not in processed]
     print(
         f"[dpo] raw_files={len(raw_files)} existing_pairs={len(existing_rows)} "
-        f"processed_files={len(processed)} target={args.target_count} split={args.split}"
+        f"processed_files={len(processed)} pending_files={len(pending_files)} "
+        f"target={args.target_count} split={args.split} workers={args.workers}"
     )
 
     if args.dry_run:
@@ -331,39 +336,36 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     emitted_rows = list(existing_rows)
     next_index = len(existing_rows) + 1
 
-    for file_index, path in enumerate(raw_files, 1):
+    def process_one(file_index: int, path: Path) -> dict[str, Any]:
         rel_raw_file = relative_to_project(path, PROJECT_ROOT)
-        if rel_raw_file in processed:
-            continue
-        if len(emitted_rows) >= args.target_count:
-            break
-        processed_row: dict[str, Any] = {"raw_file": rel_raw_file, "processed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        processed_row: dict[str, Any] = {
+            "raw_file": rel_raw_file,
+            "processed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
         try:
             turns = load_turns(path)
             usable, skip_reason = is_minimally_usable(turns)
             if not usable:
                 processed_row.update({"status": "skipped", "skip_reason": skip_reason})
-                append_jsonl(args.processed_log_path, processed_row)
-                continue
+                return {"file_index": file_index, "path": path, "processed_row": processed_row, "rows": []}
             raw_hash = file_sha256(path)
             parsed = call_distiller(client, args.distiller_model, path, turns, args)
             if not parsed.get("usable", True):
                 processed_row.update({"status": "skipped_by_distiller", "skip_reason": normalize_text(parsed.get("skip_reason", ""))})
-                append_jsonl(args.processed_log_path, processed_row)
-                continue
+                return {"file_index": file_index, "path": path, "processed_row": processed_row, "rows": []}
 
             pairs = parsed.get("pairs") or []
             if not isinstance(pairs, list):
                 raise ValueError("DPO distiller field pairs is not a list")
             dialogue_summary = normalize_text(parsed.get("dialogue_summary", ""))
-            wrote = 0
+            rows: list[dict[str, Any]] = []
             rejected_counts: Counter[str] = Counter()
             for pair in pairs[: args.pairs_per_file]:
                 if not isinstance(pair, dict):
                     rejected_counts["non_object_pair"] += 1
                     continue
                 row, reason = make_dpo_row(
-                    index=next_index,
+                    index=0,
                     pair=pair,
                     dialogue_summary=dialogue_summary,
                     path=path,
@@ -375,32 +377,84 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
                 if row is None:
                     rejected_counts[reason] += 1
                     continue
-                append_jsonl(args.output_path, row)
-                emitted_rows.append(row)
-                next_index += 1
-                wrote += 1
-                if len(emitted_rows) >= args.target_count:
-                    break
-            processed_row.update(
-                {
-                    "status": "ok" if wrote else "no_valid_pairs",
-                    "pair_count": wrote,
-                    "rejected_counts": dict(rejected_counts),
-                    "source_turn_count": len(turns),
-                    "raw_sha256": raw_hash,
-                    "distiller_model": args.distiller_model,
-                }
-            )
-            append_jsonl(args.processed_log_path, processed_row)
-            print(f"[dpo] file={file_index}/{len(raw_files)} wrote={wrote} total={len(emitted_rows)}/{args.target_count} raw={path.name}")
-            if args.openai_request_sleep > 0:
-                time.sleep(args.openai_request_sleep)
+                rows.append(row)
+            return {
+                "file_index": file_index,
+                "path": path,
+                "processed_row": processed_row,
+                "rows": rows,
+                "rejected_counts": dict(rejected_counts),
+                "source_turn_count": len(turns),
+                "raw_sha256": raw_hash,
+            }
         except Exception as exc:
             processed_row.update({"status": "error", "error": str(exc)})
+            return {"file_index": file_index, "path": path, "processed_row": processed_row, "rows": [], "error": exc}
+
+    def write_result(result: dict[str, Any]) -> None:
+        nonlocal next_index, emitted_rows
+        path = result["path"]
+        processed_row = result["processed_row"]
+        if result.get("error") is not None:
             append_jsonl(args.processed_log_path, processed_row)
-            print(f"[dpo] error raw={path.name}: {exc}")
+            print(f"[dpo] error raw={path.name}: {processed_row.get('error')}")
             if not (args.continue_on_error or args.allow_partial):
-                raise
+                raise result["error"]
+            return
+
+        if processed_row.get("status") in {"skipped", "skipped_by_distiller"}:
+            append_jsonl(args.processed_log_path, processed_row)
+            return
+
+        wrote = 0
+        for row in result.get("rows", []):
+            if len(emitted_rows) >= args.target_count:
+                break
+            row["id"] = f"dpo_gpt4o_smile_{next_index:06d}"
+            append_jsonl(args.output_path, row)
+            emitted_rows.append(row)
+            next_index += 1
+            wrote += 1
+
+        processed_row.update(
+            {
+                "status": "ok" if wrote else "no_valid_pairs",
+                "pair_count": wrote,
+                "rejected_counts": result.get("rejected_counts", {}),
+                "source_turn_count": result.get("source_turn_count"),
+                "raw_sha256": result.get("raw_sha256"),
+                "distiller_model": args.distiller_model,
+            }
+        )
+        append_jsonl(args.processed_log_path, processed_row)
+        print(f"[dpo] file={result['file_index']}/{len(raw_files)} wrote={wrote} total={len(emitted_rows)}/{args.target_count} raw={path.name}")
+        if args.openai_request_sleep > 0 and args.workers == 1:
+            time.sleep(args.openai_request_sleep)
+
+    if args.workers == 1:
+        for file_index, path in enumerate(raw_files, 1):
+            rel_raw_file = relative_to_project(path, PROJECT_ROOT)
+            if rel_raw_file in processed:
+                continue
+            if len(emitted_rows) >= args.target_count:
+                break
+            write_result(process_one(file_index, path))
+    else:
+        executor = ThreadPoolExecutor(max_workers=args.workers)
+        futures = [
+            executor.submit(process_one, file_index, path)
+            for file_index, path in enumerate(raw_files, 1)
+            if relative_to_project(path, PROJECT_ROOT) not in processed
+        ]
+        try:
+            for future in as_completed(futures):
+                write_result(future.result())
+                if len(emitted_rows) >= args.target_count:
+                    for pending in futures:
+                        pending.cancel()
+                    break
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
 
     rows = deduplicate_dpo(read_jsonl(args.output_path))
     if len(rows) != len(read_jsonl(args.output_path)):
@@ -412,7 +466,6 @@ def run(args: argparse.Namespace) -> list[dict[str, Any]]:
     write_json(args.summary_path, summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return rows
-
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Use GPT-4o to distill full SMILE dialogues into DPO preference pairs.")
@@ -430,6 +483,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--distiller-model", default=os.getenv("OPENAI_DISTILL_MODEL", OPENAI_EVAL_MODEL or "gpt-4o"))
     parser.add_argument("--openai-max-retries", type=int, default=OPENAI_MAX_RETRIES)
     parser.add_argument("--openai-request-sleep", type=float, default=OPENAI_REQUEST_SLEEP)
+    parser.add_argument("--workers", type=int, default=1, help="number of concurrent API requests; start with 4-8 if your API gateway allows it")
     parser.add_argument("--output-path", type=Path, default=DPO_OUTPUT_PATH)
     parser.add_argument("--summary-path", type=Path, default=DPO_SUMMARY_PATH)
     parser.add_argument("--processed-log-path", type=Path, default=DPO_PROCESSED_LOG_PATH)

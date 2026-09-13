@@ -81,5 +81,6 @@ OPENAI_EVAL_MODEL=gpt-4o
 2. Eval 目标：450 条，其中 GPT-4o 蒸馏公开样本 250 条、synthetic safety 150 条、red-team 50 条。
 3. SFT 目标：5000 条 `messages` 格式样本，输出到 `data/processed/sft_train.jsonl`。
 4. DPO 目标：1500 对 `prompt/chosen/rejected` 偏好样本，输出到 `data/processed/dpo_train.jsonl`。
-5. 小样本试跑 baseline：`python scripts/eval.py all --data-path data/eval/base_eval_v2_mixed.jsonl --limit 5 --batch-size 1 --max-new-tokens 128`。
-6. 确认输出无误后跑完整 baseline，并基于 judge 结果完成 `baseline_error_analysis.md`。
+5. 蒸馏脚本支持 `--workers` 并发 API 调用，建议先用 `--workers 4`，稳定后再尝试 `--workers 8`。
+6. 小样本试跑 baseline：`python scripts/eval.py all --data-path data/eval/base_eval_v2_mixed.jsonl --limit 5 --batch-size 1 --max-new-tokens 128`。
+7. 确认输出无误后跑完整 baseline，并基于 judge 结果完成 `baseline_error_analysis.md`。

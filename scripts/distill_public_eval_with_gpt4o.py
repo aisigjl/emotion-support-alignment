@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
@@ -461,6 +462,7 @@ def summarize_rows(rows: list[dict[str, Any]], processed_rows: list[dict[str, An
         "resume_mode": not args.overwrite,
         "retry_errors": args.retry_errors,
         "continue_on_error": args.continue_on_error,
+        "workers": args.workers,
         "split": args.split,
         "manifest_path": str(args.manifest_path.relative_to(PROJECT_ROOT) if args.manifest_path.exists() and args.manifest_path.is_relative_to(PROJECT_ROOT) else args.manifest_path),
         "distiller_model": args.distiller_model,
@@ -477,6 +479,7 @@ def run_distillation(args: argparse.Namespace) -> list[dict[str, Any]]:
     args.output_path = project_path(args.output_path)
     args.summary_path = project_path(args.summary_path)
     args.processed_log_path = project_path(args.processed_log_path)
+    args.workers = max(1, int(args.workers))
 
     if args.overwrite:
         for path in [args.output_path, args.summary_path, args.processed_log_path]:
@@ -489,10 +492,11 @@ def run_distillation(args: argparse.Namespace) -> list[dict[str, Any]]:
 
     existing_rows = read_jsonl(args.output_path)
     processed = processed_raw_files(args.processed_log_path, args.output_path, args.retry_errors)
+    pending_files = [path for path in raw_files if str(path.relative_to(PROJECT_ROOT)) not in processed]
     print(
         f"[distill] raw_files={len(raw_files)} existing_samples={len(existing_rows)} "
-        f"processed_files={len(processed)} target={args.target_count} "
-        f"retry_errors={args.retry_errors}"
+        f"processed_files={len(processed)} pending_files={len(pending_files)} "
+        f"target={args.target_count} workers={args.workers} retry_errors={args.retry_errors}"
     )
 
     if args.dry_run:
@@ -510,13 +514,8 @@ def run_distillation(args: argparse.Namespace) -> list[dict[str, Any]]:
     next_index = len(existing_rows) + 1
     emitted_rows = list(existing_rows)
 
-    for file_index, path in enumerate(raw_files, 1):
+    def process_one(file_index: int, path: Path) -> dict[str, Any]:
         rel_raw_file = str(path.relative_to(PROJECT_ROOT))
-        if rel_raw_file in processed:
-            continue
-        if len(emitted_rows) >= args.target_count:
-            break
-
         processed_row: dict[str, Any] = {
             "raw_file": rel_raw_file,
             "processed_at": utc_now(),
@@ -527,8 +526,7 @@ def run_distillation(args: argparse.Namespace) -> list[dict[str, Any]]:
             usable, skip_reason = is_minimally_usable(turns)
             if not usable:
                 processed_row.update({"status": "skipped", "skip_reason": skip_reason})
-                append_jsonl(args.processed_log_path, processed_row)
-                continue
+                return {"file_index": file_index, "path": path, "processed_row": processed_row, "row_payloads": []}
 
             raw_hash = file_sha256(path)
             parsed = call_distiller(
@@ -547,57 +545,111 @@ def run_distillation(args: argparse.Namespace) -> list[dict[str, Any]]:
                         "skip_reason": normalize_text(parsed.get("skip_reason", "")) or "distiller_marked_unusable",
                     }
                 )
-                append_jsonl(args.processed_log_path, processed_row)
-                continue
+                return {"file_index": file_index, "path": path, "processed_row": processed_row, "row_payloads": []}
 
             samples = parsed.get("samples") or []
             if not isinstance(samples, list):
                 raise ValueError("Distiller field samples is not a list")
             dialogue_summary = normalize_text(parsed.get("dialogue_summary", ""))
-            wrote = 0
-            for sample in samples[: args.samples_per_file]:
-                if not isinstance(sample, dict):
-                    continue
-                row = make_distilled_row(
-                    index=next_index,
-                    sample=sample,
-                    dialogue_summary=dialogue_summary,
-                    path=path,
-                    raw_hash=raw_hash,
-                    turns=turns,
-                    distiller_model=args.distiller_model,
-                )
-                if row is None:
-                    continue
-                append_jsonl(args.output_path, row)
-                emitted_rows.append(row)
-                next_index += 1
-                wrote += 1
-                if len(emitted_rows) >= args.target_count:
-                    break
-
-            processed_row.update(
+            row_payloads = [
                 {
-                    "status": "ok" if wrote else "no_valid_samples",
-                    "sample_count": wrote,
-                    "source_turn_count": len(turns),
-                    "raw_sha256": raw_hash,
-                    "distiller_model": args.distiller_model,
+                    "sample": sample,
+                    "dialogue_summary": dialogue_summary,
+                    "path": path,
+                    "raw_hash": raw_hash,
+                    "turns": turns,
                 }
-            )
-            append_jsonl(args.processed_log_path, processed_row)
-            print(
-                f"[distill] file={file_index}/{len(raw_files)} wrote={wrote} "
-                f"total={len(emitted_rows)}/{args.target_count} raw={path.name}"
-            )
-            if args.openai_request_sleep > 0:
-                time.sleep(args.openai_request_sleep)
+                for sample in samples[: args.samples_per_file]
+                if isinstance(sample, dict)
+            ]
+            return {
+                "file_index": file_index,
+                "path": path,
+                "processed_row": processed_row,
+                "row_payloads": row_payloads,
+                "source_turn_count": len(turns),
+                "raw_sha256": raw_hash,
+            }
         except Exception as exc:
             processed_row.update({"status": "error", "error": str(exc)})
+            return {"file_index": file_index, "path": path, "processed_row": processed_row, "row_payloads": [], "error": exc}
+
+    def write_result(result: dict[str, Any]) -> None:
+        nonlocal next_index, emitted_rows
+        path = result["path"]
+        processed_row = result["processed_row"]
+        if result.get("error") is not None:
             append_jsonl(args.processed_log_path, processed_row)
-            print(f"[distill] error raw={path.name}: {exc}")
+            print(f"[distill] error raw={path.name}: {processed_row.get('error')}")
             if not (args.continue_on_error or args.allow_partial):
-                raise
+                raise result["error"]
+            return
+
+        if processed_row.get("status") in {"skipped", "skipped_by_distiller"}:
+            append_jsonl(args.processed_log_path, processed_row)
+            return
+
+        wrote = 0
+        for payload in result.get("row_payloads", []):
+            if len(emitted_rows) >= args.target_count:
+                break
+            row = make_distilled_row(
+                index=next_index,
+                sample=payload["sample"],
+                dialogue_summary=payload["dialogue_summary"],
+                path=payload["path"],
+                raw_hash=payload["raw_hash"],
+                turns=payload["turns"],
+                distiller_model=args.distiller_model,
+            )
+            if row is None:
+                continue
+            append_jsonl(args.output_path, row)
+            emitted_rows.append(row)
+            next_index += 1
+            wrote += 1
+
+        processed_row.update(
+            {
+                "status": "ok" if wrote else "no_valid_samples",
+                "sample_count": wrote,
+                "source_turn_count": result.get("source_turn_count"),
+                "raw_sha256": result.get("raw_sha256"),
+                "distiller_model": args.distiller_model,
+            }
+        )
+        append_jsonl(args.processed_log_path, processed_row)
+        print(
+            f"[distill] file={result['file_index']}/{len(raw_files)} wrote={wrote} "
+            f"total={len(emitted_rows)}/{args.target_count} raw={path.name}"
+        )
+        if args.openai_request_sleep > 0 and args.workers == 1:
+            time.sleep(args.openai_request_sleep)
+
+    if args.workers == 1:
+        for file_index, path in enumerate(raw_files, 1):
+            rel_raw_file = str(path.relative_to(PROJECT_ROOT))
+            if rel_raw_file in processed:
+                continue
+            if len(emitted_rows) >= args.target_count:
+                break
+            write_result(process_one(file_index, path))
+    else:
+        executor = ThreadPoolExecutor(max_workers=args.workers)
+        futures = [
+            executor.submit(process_one, file_index, path)
+            for file_index, path in enumerate(raw_files, 1)
+            if str(path.relative_to(PROJECT_ROOT)) not in processed
+        ]
+        try:
+            for future in as_completed(futures):
+                write_result(future.result())
+                if len(emitted_rows) >= args.target_count:
+                    for pending in futures:
+                        pending.cancel()
+                    break
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
 
     unique_rows = deduplicate(read_jsonl(args.output_path))
     if len(unique_rows) != len(read_jsonl(args.output_path)):
@@ -617,7 +669,6 @@ def run_distillation(args: argparse.Namespace) -> list[dict[str, Any]]:
     write_json(args.summary_path, summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return emitted_rows
-
 
 def select_public_rows(rows: list[dict[str, Any]], public_count: int, seed: int) -> list[dict[str, Any]]:
     rng = random.Random(seed)
@@ -822,6 +873,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--distiller-model", default=os.getenv("OPENAI_DISTILL_MODEL", OPENAI_EVAL_MODEL or "gpt-4o"))
     parser.add_argument("--openai-max-retries", type=int, default=OPENAI_MAX_RETRIES)
     parser.add_argument("--openai-request-sleep", type=float, default=OPENAI_REQUEST_SLEEP)
+    parser.add_argument("--workers", type=int, default=1, help="number of concurrent API requests; start with 4-8 if your API gateway allows it")
     parser.add_argument("--output-path", type=Path, default=DISTILLED_OUTPUT_PATH)
     parser.add_argument("--summary-path", type=Path, default=DISTILLED_SUMMARY_PATH)
     parser.add_argument("--processed-log-path", type=Path, default=DISTILLED_PROCESSED_LOG_PATH)

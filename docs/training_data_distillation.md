@@ -36,7 +36,7 @@ The split is at raw-file level. A SMILE JSON file belongs to exactly one split, 
 Build the 450-sample mixed eval set:
 
 ```bash
-env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY   python scripts/distill_public_eval_with_gpt4o.py   --manifest-path data/processed/smile_split_manifest.json   --split eval   --target-count 250   --max-files 400   --samples-per-file 2   --build-mixed   --public-count 250   --synthetic-count 150   --redteam-count 50   --continue-on-error   --retry-errors
+env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY   python scripts/distill_public_eval_with_gpt4o.py   --manifest-path data/processed/smile_split_manifest.json   --split eval   --target-count 250   --max-files 400   --samples-per-file 2   --build-mixed   --public-count 250   --synthetic-count 150   --redteam-count 50   --continue-on-error   --retry-errors   --workers 4
 ```
 
 This creates:
@@ -51,7 +51,7 @@ data/eval/base_eval_v2_mixed.jsonl
 Build 5000 SFT chat samples:
 
 ```bash
-env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY   python scripts/distill_sft_with_gpt4o.py   --manifest-path data/processed/smile_split_manifest.json   --split sft   --target-count 5000   --max-files 6000   --samples-per-file 1   --output-path data/processed/sft_train.jsonl   --summary-path data/processed/sft_train_summary.json   --processed-log-path data/processed/sft_distilled_processed.jsonl   --continue-on-error   --retry-errors
+env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY   python scripts/distill_sft_with_gpt4o.py   --manifest-path data/processed/smile_split_manifest.json   --split sft   --target-count 5000   --max-files 6000   --samples-per-file 1   --output-path data/processed/sft_train.jsonl   --summary-path data/processed/sft_train_summary.json   --processed-log-path data/processed/sft_distilled_processed.jsonl   --continue-on-error   --retry-errors   --workers 4
 ```
 
 Each row contains:
@@ -72,7 +72,7 @@ The assistant response is rewritten by GPT-4o and filtered by project safety heu
 Build 1500 DPO preference pairs:
 
 ```bash
-env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY   python scripts/distill_dpo_with_gpt4o.py   --manifest-path data/processed/smile_split_manifest.json   --split dpo   --target-count 1500   --max-files 2500   --pairs-per-file 1   --output-path data/processed/dpo_train.jsonl   --summary-path data/processed/dpo_train_summary.json   --processed-log-path data/processed/dpo_distilled_processed.jsonl   --continue-on-error   --retry-errors
+env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY   python scripts/distill_dpo_with_gpt4o.py   --manifest-path data/processed/smile_split_manifest.json   --split dpo   --target-count 1500   --max-files 2500   --pairs-per-file 1   --output-path data/processed/dpo_train.jsonl   --summary-path data/processed/dpo_train_summary.json   --processed-log-path data/processed/dpo_distilled_processed.jsonl   --continue-on-error   --retry-errors   --workers 4
 ```
 
 Each row contains TRL-compatible conversational preference fields:
@@ -85,7 +85,29 @@ rejected: assistant message list
 
 `chosen` is a safe, higher-quality response. `rejected` is a plausible weaker response with a clear preference issue, but it is filtered to avoid concrete self-harm, violence, or medication dosage instructions.
 
-## 6. Resume Behavior
+## 6. Parallel API Calls
+
+All three distillation scripts support concurrent synchronous API calls through `--workers`.
+
+Recommended starting values:
+
+```text
+workers=4: safer default for OpenAI-compatible gateways
+workers=8: faster, use if you do not see rate-limit or timeout errors
+workers=1: fallback when the gateway is unstable
+```
+
+Example:
+
+```bash
+python scripts/distill_sft_with_gpt4o.py --target-count 5000 --workers 4 --continue-on-error --retry-errors
+```
+
+If you see rate-limit, timeout, or connection errors, lower `--workers` and rerun with `--retry-errors`. The scripts keep incremental outputs and processed logs, so failed files can be retried without discarding successful rows.
+
+Official OpenAI Batch API is different from this implementation. Batch API can process asynchronous request groups with separate limits and lower cost, but it has a completion window and may not be supported by every OpenAI-compatible gateway. For this project, `--workers` is the practical default; Batch API can be a later optimization if you run directly on an endpoint that supports it.
+
+## 7. Resume Behavior
 
 All three distillation scripts write output incrementally and keep a processed-file log.
 
@@ -115,7 +137,7 @@ add --overwrite
 
 Do not use `--overwrite` during normal resume.
 
-## 7. Recommended Execution Order
+## 8. Recommended Execution Order
 
 ```text
 1. python scripts/prepare_data_split.py ...
@@ -130,7 +152,7 @@ Do not use `--overwrite` during normal resume.
 10. Evaluate base / SFT / SFT+DPO on the same fixed eval set
 ```
 
-## 8. Quality Checks
+## 9. Quality Checks
 
 Before training, manually inspect at least:
 
@@ -149,7 +171,7 @@ Reject or regenerate data if you see:
 - overlong, generic, or lecture-like responses
 - near-duplicate user inputs
 
-## 9. OpenAI API Notes
+## 10. OpenAI API Notes
 
 The scripts use the OpenAI Python SDK and Chat Completions with JSON-object output when the configured endpoint supports it. If your gateway rejects `response_format`, the helper retries without JSON mode and parses the JSON object from the returned text.
 
