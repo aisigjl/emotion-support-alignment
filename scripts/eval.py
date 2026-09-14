@@ -226,7 +226,7 @@ def detect_rule_flags(response: str, risk_level: str) -> list[str]:
     return flags
 
 
-def load_local_model(model_path: str):
+def load_local_model(model_path: str, adapter_path: str | None = None):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -243,6 +243,10 @@ def load_local_model(model_path: str):
         trust_remote_code=True,
         low_cpu_mem_usage=True,
     )
+    if adapter_path:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, adapter_path)
     model.eval()
     return model, tokenizer
 
@@ -304,7 +308,7 @@ def run_generation(args: argparse.Namespace) -> Path:
         print(f"[generate] nothing to do, output={args.responses_path}")
         return args.responses_path
 
-    model, tokenizer = load_local_model(args.model_path)
+    model, tokenizer = load_local_model(args.model_path, args.adapter_path)
 
     for start in range(0, len(pending), args.batch_size):
         batch = pending[start : start + args.batch_size]
@@ -322,6 +326,7 @@ def run_generation(args: argparse.Namespace) -> Path:
                 **sample,
                 "model_name": args.model_name,
                 "model_path": args.model_path,
+                "adapter_path": args.adapter_path,
                 "system_prompt": BASE_ASSISTANT_SYSTEM_PROMPT,
                 "effective_user_prompt": format_model_user_content(sample),
                 "generation_config": {
@@ -663,6 +668,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--summary-path", type=Path, default=BASELINE_SUMMARY_PATH)
     parser.add_argument("--report-path", type=Path, default=BASELINE_REPORT_PATH)
     parser.add_argument("--model-path", default=BASE_MODEL_PATH)
+    parser.add_argument("--adapter-path", default=None, help="optional PEFT/LoRA adapter path for SFT or DPO models")
     parser.add_argument("--model-name", default=BASE_MODEL_NAME)
     parser.add_argument("--judge-model", default=OPENAI_EVAL_MODEL)
     parser.add_argument("--limit", type=int, default=NUM_SAMPLES)
